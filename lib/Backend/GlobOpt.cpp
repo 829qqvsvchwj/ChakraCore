@@ -603,6 +603,11 @@ GlobOpt::OptBlock(BasicBlock *block)
                     this->tempBv->And(liveOnBackEdge);
                     this->ToFloat64(this->tempBv, block->loop->landingPad);
 
+                    if (block->loop->symsRequiringCompensationToMergedValueInfoMap)
+                    {
+                        InsertValueCompensation(block, block->loop->symsRequiringCompensationToMergedValueInfoMap);
+                    }
+
                     // Now that we're done with the liveFields within this loop, trim the set to those syms
                     // that the backward pass told us were live out of the loop.
                     // This assumes we have no further need of the liveFields within the loop.
@@ -1155,10 +1160,10 @@ void GlobOpt::FieldPRE(Loop *loop)
 
 void GlobOpt::InsertValueCompensation(
     BasicBlock *const predecessor,
-    const SymToValueInfoMap &symsRequiringCompensationToMergedValueInfoMap)
+    const SymToValueInfoMap *symsRequiringCompensationToMergedValueInfoMap)
 {
     Assert(predecessor);
-    Assert(symsRequiringCompensationToMergedValueInfoMap.Count() != 0);
+    Assert(symsRequiringCompensationToMergedValueInfoMap->Count() != 0);
 
     IR::Instr *insertBeforeInstr = predecessor->GetLastInstr();
     Func *const func = insertBeforeInstr->m_func;
@@ -1197,7 +1202,7 @@ void GlobOpt::InsertValueCompensation(
         }
     };
     JsUtil::List<DelayChangeValueInfo, ArenaAllocator> delayChangeValueInfo(alloc);
-    for(auto it = symsRequiringCompensationToMergedValueInfoMap.GetIterator(); it.IsValid(); it.MoveNext())
+    for(auto it = symsRequiringCompensationToMergedValueInfoMap->GetIterator(); it.IsValid(); it.MoveNext())
     {
         const auto &entry = it.Current();
         Sym *const sym = entry.Key();
@@ -1846,6 +1851,10 @@ GlobOpt::IsAllowedForMemOpt(IR::Instr* instr, bool isMemset, IR::RegOpnd *baseOp
             TRACE_MEMOP_VERBOSE(loop, instr, _u("Missing bounds check optimization"));
             return false;
         }
+    }
+    else
+    {
+        return false;
     }
 
     if (!baseValueType.IsTypedArray())
@@ -2673,6 +2682,11 @@ GlobOpt::OptInstr(IR::Instr *&instr, bool* isInstrRemoved)
         }
     }
 
+    if (this->IsLazyBailOutCurrentlyNeeded(instr, src1Val, src2Val, isHoisted))
+    {
+        this->GenerateLazyBailOut(instr);
+    }
+
     if (CurrentBlockData()->capturedValuesCandidate && !this->IsLoopPrePass())
     {
         this->CommitCapturedValuesCandidate();
@@ -2688,6 +2702,15 @@ GlobOpt::OptInstr(IR::Instr *&instr, bool* isInstrRemoved)
     }
 #endif
     return instrNext;
+}
+
+bool
+GlobOpt::IsNonNumericRegOpnd(IR::RegOpnd *opnd, bool inGlobOpt) const
+{
+    return opnd && (
+        opnd->m_sym->m_isNotNumber ||
+        (inGlobOpt && !opnd->GetValueType().IsNumber() && !currentBlock->globOptData.IsTypeSpecialized(opnd->m_sym))
+    );
 }
 
 bool
@@ -2850,12 +2873,6 @@ GlobOpt::OptDst(
         if (opnd->IsSymOpnd() && opnd->AsSymOpnd()->IsPropertySymOpnd())
         {
             this->FinishOptPropOp(instr, opnd->AsPropertySymOpnd());
-        }
-        else if (instr->m_opcode == Js::OpCode::StElemI_A ||
-                 instr->m_opcode == Js::OpCode::StElemI_A_Strict ||
-                 instr->m_opcode == Js::OpCode::InitComputedProperty)
-        {
-            this->KillObjectHeaderInlinedTypeSyms(this->currentBlock, false);
         }
 
         if (opnd->IsIndirOpnd() && !this->IsLoopPrePass())
@@ -3257,7 +3274,7 @@ GlobOpt::OptSrc(IR::Opnd *opnd, IR::Instr * *pInstr, Value **indirIndexValRef, I
         }
         originalPropertySym = sym->AsPropertySym();
 
-        // Dont give a vale to 'arguments' property sym to prevent field copy prop of 'arguments'
+        // Dont give a value to 'arguments' property sym to prevent field copy prop of 'arguments'
         if (originalPropertySym->AsPropertySym()->m_propertyId == Js::PropertyIds::arguments &&
             originalPropertySym->AsPropertySym()->m_fieldKind == PropertyKindData)
         {
@@ -17110,6 +17127,9 @@ GlobOpt::EmitMemop(Loop * loop, LoopCount *loopCount, const MemOpEmitData* emitD
     memopInstr->SetSrc1(src1);
     memopInstr->SetSrc2(sizeOpnd);
     insertBeforeInstr->InsertBefore(memopInstr);
+
+
+    loop->memOpInfo->instr = memopInstr;
 
 #if DBG_DUMP
     if (DO_MEMOP_TRACE())
